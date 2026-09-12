@@ -40,6 +40,7 @@ struct MangobarTrayItem {
   bool item_is_menu;
   pixman_image_t *icon;
   int icon_size;
+  unsigned icon_rev;
   sd_bus_slot **slots;
   int slot_count;
   struct MangobarTray *tray;
@@ -654,6 +655,7 @@ static void reload_icon(MangobarTrayItem *sni) {
   pixman_image_t *old = sni->icon;
   sni->icon = NULL;
   sni->icon_size = 0;
+  sni->icon_rev++;
   bool attention = sni->status && sni->status[0] == 'N';
   const char *icon_name = attention ? sni->attention_icon_name : sni->icon_name;
   TrayPixmap **pixmaps = attention ? sni->attention_pixmaps : sni->pixmaps;
@@ -1319,6 +1321,9 @@ pixman_image_t *tray_item_icon(MangobarTrayItem *item) {
 }
 int tray_item_icon_size(MangobarTrayItem *item) {
   return item ? item->icon_size : 0;
+}
+unsigned tray_item_icon_rev(MangobarTrayItem *item) {
+  return item ? item->icon_rev : 0;
 }
 void tray_remove_item(MangobarTray *tray, MangobarTrayItem *item) {
   if (!tray || !item)

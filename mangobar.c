@@ -425,7 +425,89 @@ typedef struct {
   uint32_t x1, x2; // logical coords
 } TrayHotspot;
 
+#define MAX_MODULE_ENTRIES 128
+#define MANGOBAR_BUF_POOL 2
+#define BAR_MAX_SLOTS (MAX_MODULE_ENTRIES * 3)
+
+#define BAR_MAX_DIRTY 8
 typedef struct {
+  int n;
+  int x0[BAR_MAX_DIRTY], y0[BAR_MAX_DIRTY];
+  int x1[BAR_MAX_DIRTY], y1[BAR_MAX_DIRTY];
+} DirtyList;
+
+static bool rect_overlap(int ax0, int ay0, int ax1, int ay1, int bx0, int by0,
+                         int bx1, int by1) {
+  return ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1;
+}
+
+static void dirty_add(DirtyList *d, int x0, int y0, int x1, int y1) {
+  if (x1 <= x0 || y1 <= y0)
+    return;
+  if (d->n >= BAR_MAX_DIRTY) {
+    for (int i = 0; i < d->n; i++) {
+      if (d->x0[i] < x0)
+        x0 = d->x0[i];
+      if (d->y0[i] < y0)
+        y0 = d->y0[i];
+      if (d->x1[i] > x1)
+        x1 = d->x1[i];
+      if (d->y1[i] > y1)
+        y1 = d->y1[i];
+    }
+    d->n = 1;
+    d->x0[0] = x0;
+    d->y0[0] = y0;
+    d->x1[0] = x1;
+    d->y1[0] = y1;
+    return;
+  }
+  d->x0[d->n] = x0;
+  d->y0[d->n] = y0;
+  d->x1[d->n] = x1;
+  d->y1[d->n] = y1;
+  d->n++;
+  bool merged = true;
+  while (merged) {
+    merged = false;
+    for (int i = 0; i < d->n && !merged; i++) {
+      for (int j = i + 1; j < d->n && !merged; j++) {
+        if (!rect_overlap(d->x0[i], d->y0[i], d->x1[i], d->y1[i], d->x0[j],
+                          d->y0[j], d->x1[j], d->y1[j]))
+          continue;
+        if (d->x0[j] < d->x0[i])
+          d->x0[i] = d->x0[j];
+        if (d->y0[j] < d->y0[i])
+          d->y0[i] = d->y0[j];
+        if (d->x1[j] > d->x1[i])
+          d->x1[i] = d->x1[j];
+        if (d->y1[j] > d->y1[i])
+          d->y1[i] = d->y1[j];
+        int last = d->n - 1;
+        d->x0[j] = d->x0[last];
+        d->y0[j] = d->y0[last];
+        d->x1[j] = d->x1[last];
+        d->y1[j] = d->y1[last];
+        d->n--;
+        merged = true;
+      }
+    }
+  }
+}
+
+typedef struct {
+  char ident[80];
+  char key[160];
+  uint32_t x0, y0, x1, y1;
+  pixman_image_t *raster;
+} BarSlot;
+
+typedef struct {
+  struct Bar *bar;
+  int idx;
+} BarBufTag;
+
+typedef struct Bar {
   struct wl_output *wl_output;
   struct wl_surface *wl_surface;
   struct zwlr_layer_surface_v1 *layer_surface;
@@ -472,6 +554,23 @@ typedef struct {
   int hotspot_count;
   TrayHotspot tray_hotspots[MAX_TRAY_HOTSPOTS];
   int tray_hotspot_count;
+  pixman_image_t *cache;
+  pixman_image_t *w_fg, *w_mask, *w_bg;
+  uint32_t cache_w, cache_h;
+  bool paint_all;
+  bool commit_pending;
+  BarSlot slots[BAR_MAX_SLOTS];
+  int slot_n;
+  bool mid_painted;
+  int mid_x0, mid_x1;
+  uint64_t mid_key;
+  DirtyList dirty;
+  struct wl_buffer *buf[MANGOBAR_BUF_POOL];
+  void *buf_data[MANGOBAR_BUF_POOL];
+  size_t buf_size[MANGOBAR_BUF_POOL];
+  bool buf_busy[MANGOBAR_BUF_POOL];
+  int buf_next;
+  BarBufTag buf_tag[MANGOBAR_BUF_POOL];
   struct wl_list link;
 } Bar;
 
@@ -770,7 +869,14 @@ static void record_tray_hotspot(Bar *bar, MangobarTrayItem *item, uint32_t x1,
       (TrayHotspot){item, x1, x2};
 }
 
-// Draw a module (background + text + record hotspot)
+typedef struct {
+  uint32_t x0;
+  uint32_t x1;
+  uint32_t x2;
+  uint32_t end;
+  uint32_t paint;
+} EntryGeom;
+
 static int module_radius(const ModuleStyle *st, uint32_t h) {
   int r = st->radius;
   if (st->radius < 0)
@@ -780,13 +886,12 @@ static int module_radius(const ModuleStyle *st, uint32_t h) {
   return r;
 }
 
-static uint32_t draw_module(Bar *bar, const char *module, int tag,
-                            const char *text, ModuleStyle *st, uint32_t x,
-                            uint32_t y, pixman_image_t *fg,
-                            pixman_image_t *fg_mask, pixman_image_t *bg,
-                            uint32_t max_x, uint32_t buf_h) {
+static EntryGeom layout_module(Bar *bar, const char *module, int tag,
+                               const char *text, const ModuleStyle *st,
+                               uint32_t x, uint32_t buf_h, uint32_t group_max) {
+  EntryGeom g = {.x0 = x, .x1 = x, .x2 = x, .end = x, .paint = x};
   if (!text || !*text)
-    return x;
+    return g;
   int32_t mn = 0, mx = 0;
   uint32_t tw = text_metrics(text, &mn, &mx);
   uint32_t body = tw + st->pad_l + st->pad_r;
@@ -795,11 +900,31 @@ static uint32_t draw_module(Bar *bar, const char *module, int tag,
     mw = (uint32_t)st->min_width;
     body = mw - st->margin_l - st->margin_r;
   }
-  uint32_t x0 = x;
-  uint32_t x1 = x + st->margin_l;
-  uint32_t x2 = x1 + body;
-  if (x2 > max_x)
-    x2 = max_x;
+  g.x0 = x;
+  g.x1 = x + st->margin_l;
+  g.x2 = g.x1 + body;
+  if (g.x2 > group_max)
+    g.x2 = group_max;
+  g.paint = g.x2 > g.x1 ? g.x2 : g.x1;
+  g.end = x + mw;
+  if (g.end > group_max)
+    g.end = group_max;
+  record_hotspot(bar, module, tag, g.x0, g.end);
+  return g;
+}
+
+static void paint_module(Bar *bar, const char *module, int tag,
+                         const char *text, ModuleStyle *st, const EntryGeom *g,
+                         uint32_t y, pixman_image_t *fg,
+                         pixman_image_t *fg_mask, pixman_image_t *bg,
+                         uint32_t buf_h) {
+  if (!text || !*text)
+    return;
+  int32_t mn = 0, mx = 0;
+  uint32_t tw = text_metrics(text, &mn, &mx);
+  uint32_t x1 = g->x1;
+  uint32_t x2 = g->x2;
+  uint32_t max_x = g->x2;
   if (x2 > x1) {
     int rad = module_radius(st, buf_h);
     // Rounded background
@@ -854,11 +979,6 @@ static uint32_t draw_module(Bar *bar, const char *module, int tag,
     }
     draw_text(text, text_x, y, fg, fg_mask, NULL, &st->fg, NULL, max_x, buf_h);
   }
-  uint32_t end = x + mw;
-  if (end > max_x)
-    end = max_x;
-  record_hotspot(bar, module, tag, x0, end);
-  return end;
 }
 
 static int alt_index(const char *module) {
@@ -994,8 +1114,6 @@ static void draw_tray_icon(pixman_image_t *dst, pixman_image_t *icon,
   pixman_image_unref(scaled);
 }
 
-#define MAX_MODULE_ENTRIES 128
-
 typedef struct {
   const char *text;
   ModuleStyle *st;
@@ -1005,6 +1123,11 @@ typedef struct {
   uint32_t width;
   int tray_icon_size;
 } ModuleEntry;
+
+typedef struct {
+  ModuleEntry e;
+  EntryGeom g;
+} LaidEntry;
 
 // Per-module max display width in pixels; 0 = unlimited.
 static int module_max_length(const char *module) {
@@ -1345,16 +1468,42 @@ static uint32_t module_entry_width(const ModuleEntry *e) {
   return mw;
 }
 
-static uint32_t draw_tray_entry(Bar *bar, const ModuleEntry *e, uint32_t x,
-                                uint32_t y, pixman_image_t *fg,
-                                pixman_image_t *fg_mask, pixman_image_t *bg,
-                                uint32_t max_x, uint32_t buf_h) {
+static EntryGeom layout_tray_entry(Bar *bar, const ModuleEntry *e, uint32_t x,
+                                   uint32_t max_x, uint32_t buf_h) {
+  EntryGeom g = {.x0 = x, .x1 = x, .x2 = x, .end = x + e->width, .paint = x};
   int count = 0;
   MangobarTrayItem **items = tray_visible_items(tray, &count);
   uint32_t tray_x1 = x + g_rt->st_tray.margin_l;
-  uint32_t tray_body_w = e->width - g_rt->st_tray.margin_l - g_rt->st_tray.margin_r;
+  uint32_t tray_body_w =
+      e->width - g_rt->st_tray.margin_l - g_rt->st_tray.margin_r;
   if (tray_x1 + tray_body_w > max_x)
     tray_body_w = max_x > tray_x1 ? max_x - tray_x1 : 0;
+  g.x1 = tray_x1;
+  g.x2 = tray_x1 + tray_body_w;
+  g.paint = g.x2;
+  int tpad = g_rt->st_tray.pad_l > 0 ? g_rt->st_tray.pad_l : g_cfg.tray_pad;
+  int tsize = e->tray_icon_size;
+  uint32_t cur = tray_x1;
+  for (int i = 0; i < count; i++) {
+    uint32_t x2 = cur + (uint32_t)tsize + (uint32_t)tpad +
+                  (uint32_t)g_rt->st_tray.pad_r;
+    record_tray_hotspot(bar, items[i], cur, x2);
+    if (x2 > g.paint)
+      g.paint = x2;
+    cur += (uint32_t)(tsize + g_cfg.tray_gap);
+  }
+  (void)buf_h;
+  return g;
+}
+
+static void paint_tray_entry(Bar *bar, const ModuleEntry *e, const EntryGeom *g,
+                             uint32_t y, pixman_image_t *fg,
+                             pixman_image_t *fg_mask, pixman_image_t *bg,
+                             uint32_t buf_h) {
+  int count = 0;
+  MangobarTrayItem **items = tray_visible_items(tray, &count);
+  uint32_t tray_x1 = g->x1;
+  uint32_t tray_body_w = g->x2 > g->x1 ? g->x2 - g->x1 : 0;
   if (bar_bg_cr && tray_body_w > 0) {
     cairo_pattern_t *pat = NULL;
     if (g_rt->st_tray.bg_gradient) {
@@ -1399,22 +1548,296 @@ static uint32_t draw_tray_entry(Bar *bar, const ModuleEntry *e, uint32_t x,
     int dx = (int)cur + tpad;
     int dy = g_rt->bar_top + ((int)buf_h - tsize) / 2;
     draw_tray_icon(bg, tray_item_icon(items[i]), tsize, dx, dy);
-    record_tray_hotspot(bar, items[i], (uint32_t)cur,
-                        (uint32_t)(cur + (uint32_t)tsize + (uint32_t)tpad +
-                                   g_rt->st_tray.pad_r));
     cur += (uint32_t)(tsize + g_cfg.tray_gap);
   }
-  return x + e->width;
 }
 
-static uint32_t draw_module_entry(Bar *bar, const ModuleEntry *e, uint32_t x,
-                                  uint32_t y, pixman_image_t *fg,
-                                  pixman_image_t *fg_mask, pixman_image_t *bg,
-                                  uint32_t max_x, uint32_t buf_h) {
-  if (e->is_tray)
-    return draw_tray_entry(bar, e, x, y, fg, fg_mask, bg, max_x, buf_h);
-  return draw_module(bar, e->module, e->tag, e->text, e->st, x, y, fg, fg_mask,
-                     bg, max_x, buf_h);
+static uint64_t hash_mix(uint64_t h, uint64_t v) {
+  h ^= v;
+  h *= 1099511628211ULL;
+  return h;
+}
+
+static uint64_t style_sig(const ModuleStyle *st) {
+  uint64_t h = 1469598103934665603ULL;
+  h = hash_mix(h, ((uint64_t)st->fg.red << 48) | ((uint64_t)st->fg.green << 32) |
+                      ((uint64_t)st->fg.blue << 16) | st->fg.alpha);
+  h = hash_mix(h, ((uint64_t)st->bg.red << 48) | ((uint64_t)st->bg.green << 32) |
+                      ((uint64_t)st->bg.blue << 16) | st->bg.alpha);
+  h = hash_mix(h, ((uint64_t)st->gradient_end.red << 48) |
+                      ((uint64_t)st->gradient_end.green << 32) |
+                      ((uint64_t)st->gradient_end.blue << 16) |
+                      st->gradient_end.alpha);
+  h = hash_mix(h, (uint64_t)(st->bg_gradient ? 1u : 0u) |
+                      ((uint64_t)(st->gradient_dir & 3) << 1) |
+                      ((uint64_t)(st->center ? 1u : 0u) << 3));
+  h = hash_mix(h, ((uint64_t)(uint32_t)st->pad_l << 48) |
+                      ((uint64_t)(uint32_t)st->pad_r << 32) |
+                      ((uint64_t)(uint32_t)st->margin_l << 16) |
+                      (uint64_t)(uint32_t)st->margin_r);
+  h = hash_mix(h, ((uint64_t)(uint32_t)st->radius << 32) |
+                      (uint64_t)(uint32_t)st->min_width);
+  return h;
+}
+
+static void clear_box(pixman_image_t *img, int x0, int y0, int x1, int y1) {
+  if (!img || x1 <= x0 || y1 <= y0)
+    return;
+  pixman_color_t transparent = {0, 0, 0, 0};
+  pixman_image_fill_boxes(PIXMAN_OP_SRC, img, &transparent, 1,
+                          &(pixman_box32_t){x0, y0, x1, y1});
+}
+
+static void blit_clipped(pixman_image_t *src, pixman_image_t *dst, int dx,
+                         int dy, int cx0, int cy0, int cx1, int cy1) {
+  if (!src || !dst)
+    return;
+  int w = pixman_image_get_width(src);
+  int h = pixman_image_get_height(src);
+  int x0 = dx > cx0 ? dx : cx0;
+  int y0 = dy > cy0 ? dy : cy0;
+  int x1 = dx + w < cx1 ? dx + w : cx1;
+  int y1 = dy + h < cy1 ? dy + h : cy1;
+  if (x1 <= x0 || y1 <= y0)
+    return;
+  pixman_image_composite32(PIXMAN_OP_OVER, src, NULL, dst, x0 - dx, y0 - dy, 0,
+                           0, x0, y0, x1 - x0, y1 - y0);
+}
+
+static void entry_signature(const Bar *bar, const ModuleEntry *e, char *ident,
+                            size_t idsz, char *key, size_t ksz) {
+  if (e->tag >= 0)
+    snprintf(ident, idsz, "%s#%d", e->module ? e->module : "", e->tag);
+  else
+    snprintf(ident, idsz, "%s", e->module ? e->module : "");
+  int o = snprintf(key, ksz, "%s|%d|%016llx|%u", ident, bar->scale,
+                   (unsigned long long)style_sig(e->st), e->width);
+  if (o < 0)
+    o = 0;
+  if ((size_t)o >= ksz) {
+    key[ksz - 1] = '\0';
+    return;
+  }
+  if (e->is_tray) {
+    int n = 0;
+    MangobarTrayItem **items = tray_visible_items(tray, &n);
+    uint64_t th = 1469598103934665603ULL;
+    for (int i = 0; i < n; i++) {
+      const char *id = tray_item_id(items[i]);
+      for (const char *p = id ? id : ""; *p; p++)
+        th = hash_mix(th, (unsigned char)*p);
+      th = hash_mix(th, tray_item_icon_rev(items[i]));
+      th = hash_mix(th, (uint64_t)(uintptr_t)items[i]);
+    }
+    if ((size_t)o < ksz - 16)
+      snprintf(key + o, ksz - (size_t)o, "|t%016llx|s%d|n%d",
+               (unsigned long long)th, e->tray_icon_size, n);
+  } else if ((size_t)o < ksz - 1) {
+    snprintf(key + o, ksz - (size_t)o, "|%s", e->text ? e->text : "");
+  }
+}
+
+static pixman_image_t *render_entry_raster(Bar *bar, const LaidEntry *le,
+                                           uint32_t y, uint32_t buf_h,
+                                           int scale, int top) {
+  int x0 = (int)(le->g.x0 * (uint32_t)scale);
+  int x1 = (int)(le->g.paint * (uint32_t)scale);
+  int y0 = top * scale;
+  int h = (int)buf_h * scale;
+  if (x1 <= x0 || h <= 0)
+    return NULL;
+  int w = x1 - x0;
+  pixman_box32_t box = {x0, y0, x1, y0 + h};
+  clear_box(bar->w_bg, box.x1, box.y1, box.x2, box.y2);
+  clear_box(bar->w_fg, box.x1, box.y1, box.x2, box.y2);
+  clear_box(bar->w_mask, box.x1, box.y1, box.x2, box.y2);
+
+  bar_bg_cr = NULL;
+  uint32_t *bgdata = (uint32_t *)pixman_image_get_data(bar->w_bg);
+  if (bgdata) {
+    cairo_surface_t *cs = cairo_image_surface_create_for_data(
+        (unsigned char *)bgdata, CAIRO_FORMAT_ARGB32, bar->width, bar->height,
+        bar->width * 4);
+    if (cairo_surface_status(cs) == CAIRO_STATUS_SUCCESS) {
+      bar_bg_cr = cairo_create(cs);
+      cairo_scale(bar_bg_cr, bar->scale, bar->scale);
+      cairo_set_antialias(bar_bg_cr, CAIRO_ANTIALIAS_BEST);
+    }
+    cairo_surface_destroy(cs);
+  }
+
+  if (le->e.is_tray)
+    paint_tray_entry(bar, &le->e, &le->g, y, bar->w_fg, bar->w_mask, bar->w_bg,
+                     buf_h);
+  else
+    paint_module(bar, le->e.module, le->e.tag, le->e.text, le->e.st, &le->g, y,
+                 bar->w_fg, bar->w_mask, bar->w_bg, buf_h);
+
+  if (bar_bg_cr) {
+    cairo_destroy(bar_bg_cr);
+    bar_bg_cr = NULL;
+  }
+
+  pixman_image_t *raster =
+      pixman_image_create_bits(PIXMAN_a8r8g8b8, w, h, NULL, w * 4);
+  if (!raster)
+    return NULL;
+  clear_box(raster, 0, 0, w, h);
+  pixman_image_composite32(PIXMAN_OP_OVER, bar->w_bg, NULL, raster, x0, y0, 0,
+                           0, 0, 0, w, h);
+  pixman_image_set_alpha_map(bar->w_fg, bar->w_mask, 0, 0);
+  pixman_image_composite32(PIXMAN_OP_OVER, bar->w_fg, bar->w_mask, raster, x0,
+                           y0, x0, y0, 0, 0, w, h);
+  return raster;
+}
+
+static void bar_clear_slots(Bar *bar) {
+  for (int i = 0; i < bar->slot_n; i++) {
+    if (bar->slots[i].raster)
+      pixman_image_unref(bar->slots[i].raster);
+    bar->slots[i].raster = NULL;
+  }
+  bar->slot_n = 0;
+}
+
+static void bar_free_layers(Bar *bar) {
+  if (bar->cache)
+    pixman_image_unref(bar->cache);
+  if (bar->w_fg)
+    pixman_image_unref(bar->w_fg);
+  if (bar->w_mask)
+    pixman_image_unref(bar->w_mask);
+  if (bar->w_bg)
+    pixman_image_unref(bar->w_bg);
+  bar->cache = NULL;
+  bar->w_fg = bar->w_mask = bar->w_bg = NULL;
+  bar->cache_w = bar->cache_h = 0;
+}
+
+static void bar_free_buffers(Bar *bar) {
+  for (int i = 0; i < MANGOBAR_BUF_POOL; i++) {
+    if (bar->buf[i]) {
+      wl_buffer_destroy(bar->buf[i]);
+      bar->buf[i] = NULL;
+    }
+    if (bar->buf_data[i]) {
+      munmap(bar->buf_data[i], bar->buf_size[i]);
+      bar->buf_data[i] = NULL;
+    }
+    bar->buf_size[i] = 0;
+    bar->buf_busy[i] = false;
+  }
+  bar->buf_next = 0;
+}
+
+static void bar_buffer_release(void *data, struct wl_buffer *wl_buffer) {
+  (void)wl_buffer;
+  BarBufTag *tag = data;
+  if (tag && tag->bar && tag->idx >= 0 && tag->idx < MANGOBAR_BUF_POOL)
+    tag->bar->buf_busy[tag->idx] = false;
+}
+
+static const struct wl_buffer_listener bar_buffer_listener = {
+    .release = bar_buffer_release,
+};
+
+static bool bar_ensure_layers(Bar *bar) {
+  if (bar->cache && bar->cache_w == bar->width && bar->cache_h == bar->height)
+    return true;
+  bar_clear_slots(bar);
+  bar_free_layers(bar);
+  bar_free_buffers(bar);
+  bar->dirty.n = 0;
+  if (bar->width == 0 || bar->height == 0 || bar->bufsize == 0)
+    return false;
+
+  bar->cache = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width,
+                                        bar->height, NULL, bar->width * 4);
+  bar->w_fg = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width,
+                                       bar->height, NULL, bar->width * 4);
+  bar->w_mask = pixman_image_create_bits(PIXMAN_a8, bar->width, bar->height,
+                                         NULL, bar->width * 4);
+  bar->w_bg = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width,
+                                       bar->height, NULL, bar->width * 4);
+  if (!bar->cache || !bar->w_fg || !bar->w_mask || !bar->w_bg) {
+    bar_free_layers(bar);
+    return false;
+  }
+  clear_box(bar->cache, 0, 0, (int)bar->width, (int)bar->height);
+  clear_box(bar->w_fg, 0, 0, (int)bar->width, (int)bar->height);
+  clear_box(bar->w_mask, 0, 0, (int)bar->width, (int)bar->height);
+  clear_box(bar->w_bg, 0, 0, (int)bar->width, (int)bar->height);
+  bar->cache_w = bar->width;
+  bar->cache_h = bar->height;
+
+  for (int i = 0; i < MANGOBAR_BUF_POOL; i++) {
+    int fd = allocate_shm_file(bar->bufsize);
+    if (fd < 0) {
+      bar_free_buffers(bar);
+      bar_free_layers(bar);
+      return false;
+    }
+    void *data =
+        mmap(NULL, bar->bufsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+      close(fd);
+      bar_free_buffers(bar);
+      bar_free_layers(bar);
+      return false;
+    }
+    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, bar->bufsize);
+    bar->buf[i] = wl_shm_pool_create_buffer(pool, 0, bar->width, bar->height,
+                                            bar->stride,
+                                            WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    if (!bar->buf[i]) {
+      munmap(data, bar->bufsize);
+      bar_free_buffers(bar);
+      bar_free_layers(bar);
+      return false;
+    }
+    bar->buf_data[i] = data;
+    bar->buf_size[i] = bar->bufsize;
+    bar->buf_busy[i] = false;
+    bar->buf_tag[i].bar = bar;
+    bar->buf_tag[i].idx = i;
+    wl_buffer_add_listener(bar->buf[i], &bar_buffer_listener,
+                           &bar->buf_tag[i]);
+  }
+  bar->buf_next = 0;
+  bar->paint_all = true;
+  bar->mid_painted = false;
+  bar->mid_key = 0;
+  return true;
+}
+
+static bool bar_commit(Bar *bar, const DirtyList *dmg) {
+  if (dmg->n == 0)
+    return true;
+  int idx = -1;
+  for (int k = 0; k < MANGOBAR_BUF_POOL; k++) {
+    int i = (bar->buf_next + k) % MANGOBAR_BUF_POOL;
+    if (bar->buf[i] && !bar->buf_busy[i]) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0)
+    return false;
+  memcpy(bar->buf_data[idx], pixman_image_get_data(bar->cache), bar->bufsize);
+  wl_surface_set_buffer_scale(bar->wl_surface, bar->scale);
+  wl_surface_attach(bar->wl_surface, bar->buf[idx], 0, 0);
+  for (int i = 0; i < dmg->n; i++) {
+    wl_surface_damage_buffer(bar->wl_surface, dmg->x0[i], dmg->y0[i],
+                             dmg->x1[i] - dmg->x0[i], dmg->y1[i] - dmg->y0[i]);
+    IPC_LOG("[draw] %s damage %d,%d %dx%d\n", bar->name, dmg->x0[i],
+            dmg->y0[i], dmg->x1[i] - dmg->x0[i], dmg->y1[i] - dmg->y0[i]);
+  }
+  wl_surface_commit(bar->wl_surface);
+  bar->buf_busy[idx] = true;
+  bar->buf_next = (idx + 1) % MANGOBAR_BUF_POOL;
+  return true;
 }
 
 static void draw_bar(Bar *bar) {
@@ -1425,63 +1848,22 @@ static void draw_bar(Bar *bar) {
   g_cfg_ptr = &bar->profile->config;
   g_draw_scale = bar->scale > 0 ? (uint32_t)bar->scale : 1;
   g_draw_font = font_for_scale(bar->scale);
-  int fd = allocate_shm_file(bar->bufsize);
-  if (fd < 0) {
-    IPC_LOG("[draw] %s shm alloc FAILED\n", bar->name);
+  int scale = (int)g_draw_scale;
+
+  if (!bar_ensure_layers(bar))
     return;
-  }
-  uint32_t *data =
-      mmap(NULL, bar->bufsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (data == MAP_FAILED) {
-    close(fd);
-    return;
-  }
-
-  struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, bar->bufsize);
-  struct wl_buffer *buf = wl_shm_pool_create_buffer(
-      pool, 0, bar->width, bar->height, bar->stride, WL_SHM_FORMAT_ARGB8888);
-  wl_buffer_add_listener(buf, &wl_buffer_listener, NULL);
-  wl_shm_pool_destroy(pool);
-  close(fd);
-
-  pixman_image_t *final = pixman_image_create_bits(
-      PIXMAN_a8r8g8b8, bar->width, bar->height, data, bar->width * 4);
-  pixman_image_t *fg = pixman_image_create_bits(
-      PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
-  pixman_image_t *fg_mask = pixman_image_create_bits(
-      PIXMAN_a8, bar->width, bar->height, NULL, bar->width * 4);
-  pixman_image_t *bg = pixman_image_create_bits(
-      PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
-
-  pixman_color_t transparent = {0, 0, 0, 0};
-  pixman_image_fill_boxes(
-      PIXMAN_OP_SRC, final, &transparent, 1,
-      &(pixman_box32_t){.x1 = 0, .x2 = bar->width, .y1 = 0, .y2 = bar->height});
-  pixman_image_fill_boxes(
-      PIXMAN_OP_SRC, bg, &transparent, 1,
-      &(pixman_box32_t){.x1 = 0, .x2 = bar->width, .y1 = 0, .y2 = bar->height});
-
-  // Wrap bg in cairo for rounded module backgrounds
-  bar_bg_cr = NULL;
-  {
-    uint32_t *bgdata = (uint32_t *)pixman_image_get_data(bg);
-    if (bgdata) {
-      cairo_surface_t *cs = cairo_image_surface_create_for_data(
-          (unsigned char *)bgdata, CAIRO_FORMAT_ARGB32, bar->width,
-          bar->height, bar->width * 4);
-      if (cairo_surface_status(cs) == CAIRO_STATUS_SUCCESS) {
-        bar_bg_cr = cairo_create(cs);
-        cairo_scale(bar_bg_cr, bar->scale, bar->scale);
-        cairo_set_antialias(bar_bg_cr, CAIRO_ANTIALIAS_BEST);
-      }
-      cairo_surface_destroy(cs);
-    }
-  }
 
   bar->hotspot_count = 0;
   bar->tray_hotspot_count = 0;
 
   uint32_t y = (uint32_t)g_rt->bar_top + (g_rt->bar_h + font->ascent - font->descent) / 2;
+  uint32_t buf_h = g_rt->bar_h;
+  int top = g_rt->bar_top;
+
+  LaidEntry laid[BAR_MAX_SLOTS];
+  char fit_left[MAX_MODULE_ENTRIES][256];
+  char fit_center[MAX_MODULE_ENTRIES][256];
+  int laid_n = 0;
 
   // --- Build right modules (width known before left/center layout) ---
   ModuleEntry right_ents[MAX_MODULE_ENTRIES];
@@ -1584,9 +1966,8 @@ static void draw_bar(Bar *bar) {
   }
 
   uint32_t x = g_rt->bar_left;
-  for (int i = 0; i < left_n && x < left_max; i++) {
+  for (int i = 0; i < left_n && x < left_max && laid_n < BAR_MAX_SLOTS; i++) {
     const char *text = scratch[i].text;
-    char fit[256];
     if (strcmp(scratch[i].module, "title") == 0 && title_avail > 0 &&
         left_max > x) {
       uint32_t avail = left_max - x;
@@ -1597,12 +1978,19 @@ static void draw_bar(Bar *bar) {
       int tml = module_max_length("title");
       if (tml > 0 && avail > (uint32_t)tml + extra)
         avail = (uint32_t)tml + extra;
-      fit_text_width(text, fit, sizeof(fit), avail, extra);
-      text = fit;
+      fit_text_width(text, fit_left[i], sizeof(fit_left[i]), avail, extra);
+      text = fit_left[i];
     }
     ModuleEntry me = scratch[i];
     me.text = text;
-    x = draw_module_entry(bar, &me, x, y, fg, fg_mask, bg, left_max, g_rt->bar_h);
+    EntryGeom g = me.is_tray
+                      ? layout_tray_entry(bar, &me, x, left_max, buf_h)
+                      : layout_module(bar, me.module, me.tag, me.text, me.st, x,
+                                      buf_h, left_max);
+    laid[laid_n].e = me;
+    laid[laid_n].g = g;
+    laid_n++;
+    x = g.end;
   }
   uint32_t left_end = x;
 
@@ -1626,20 +2014,29 @@ static void draw_bar(Bar *bar) {
   }
 
   // Middle background
-  if (right_start > left_end) {
-    uint32_t s = bar->scale > 0 ? (uint32_t)bar->scale : 1;
-    pixman_image_fill_boxes(
-        PIXMAN_OP_SRC, bg, bar->sel ? &g_rt->st_bar_sel.bg : &g_rt->st_bar.bg, 1,
-        &(pixman_box32_t){.x1 = left_end * s, .x2 = right_start * s,
-                          .y1 = g_rt->bar_top * s, .y2 = (g_rt->bar_top + g_rt->bar_h) * s});
-  }
+  bool mid_valid = right_start > left_end;
+  int mid_x0 = (int)(left_end * (uint32_t)scale);
+  int mid_x1 = (int)(right_start * (uint32_t)scale);
+  int mid_y0 = top * scale;
+  int mid_y1 = (top + (int)buf_h) * scale;
+  pixman_color_t *mid_color =
+      bar->sel ? &g_rt->st_bar_sel.bg : &g_rt->st_bar.bg;
+  uint64_t mid_key = hash_mix(
+      hash_mix(hash_mix(((uint64_t)mid_color->red << 48) |
+                            ((uint64_t)mid_color->green << 32) |
+                            ((uint64_t)mid_color->blue << 16) |
+                            mid_color->alpha,
+                        ((uint64_t)(uint32_t)mid_x0 << 32) |
+                            (uint32_t)mid_x1),
+                ((uint64_t)(uint32_t)mid_y0 << 32) | (uint32_t)mid_y1),
+      (uint64_t)scale);
 
   // --- Center modules (drawn at the true screen center) ---
   if (center_n > 0) {
     uint32_t cx = center_left;
-    for (int i = 0; i < center_n && cx < center_max; i++) {
+    for (int i = 0; i < center_n && cx < center_max && laid_n < BAR_MAX_SLOTS;
+         i++) {
       const char *text = center_ents[i].text;
-      char fit[256];
       if (strcmp(center_ents[i].module, "title") == 0 &&
           center_title_avail > 0 && center_max > cx) {
         uint32_t ta = center_max - cx;
@@ -1651,58 +2048,162 @@ static void draw_bar(Bar *bar) {
         int tml = module_max_length("title");
         if (tml > 0 && ta > (uint32_t)tml + extra)
           ta = (uint32_t)tml + extra;
-        fit_text_width(text, fit, sizeof(fit), ta, extra);
-        text = fit;
+        fit_text_width(text, fit_center[i], sizeof(fit_center[i]), ta, extra);
+        text = fit_center[i];
       }
       ModuleEntry me = center_ents[i];
       me.text = text;
-      cx = draw_module_entry(bar, &me, cx, y, fg, fg_mask, bg, center_max,
-                             g_rt->bar_h);
+      EntryGeom g = me.is_tray
+                        ? layout_tray_entry(bar, &me, cx, center_max, buf_h)
+                        : layout_module(bar, me.module, me.tag, me.text, me.st,
+                                        cx, buf_h, center_max);
+      laid[laid_n].e = me;
+      laid[laid_n].g = g;
+      laid_n++;
+      cx = g.end;
     }
   }
 
   // Draw right group
   uint32_t cur_x = right_start;
-  for (int i = 0; i < right_n; i++) {
+  for (int i = 0; i < right_n && laid_n < BAR_MAX_SLOTS; i++) {
     if (cur_x >= right_edge)
       break;
-    cur_x = draw_module_entry(bar, &right_ents[i], cur_x, y, fg, fg_mask, bg,
-                              right_edge, g_rt->bar_h);
+    ModuleEntry me = right_ents[i];
+    EntryGeom g = me.is_tray
+                      ? layout_tray_entry(bar, &me, cur_x, right_edge, buf_h)
+                      : layout_module(bar, me.module, me.tag, me.text, me.st,
+                                      cur_x, buf_h, right_edge);
+    laid[laid_n].e = me;
+    laid[laid_n].g = g;
+    laid_n++;
+    cur_x = g.end;
   }
 
-  if (bar_bg_cr) {
-    cairo_destroy(bar_bg_cr);
-    bar_bg_cr = NULL;
+  DirtyList dmg = {0};
+  if (bar->paint_all)
+    dirty_add(&dmg, 0, 0, (int)bar->width, (int)bar->height);
+
+  if (mid_valid != bar->mid_painted || mid_key != bar->mid_key ||
+      (mid_valid && (mid_x0 != bar->mid_x0 || mid_x1 != bar->mid_x1))) {
+    if (bar->mid_painted)
+      dirty_add(&dmg, bar->mid_x0, mid_y0, bar->mid_x1, mid_y1);
+    if (mid_valid)
+      dirty_add(&dmg, mid_x0, mid_y0, mid_x1, mid_y1);
   }
 
-  // Composite final image
-  pixman_image_composite32(PIXMAN_OP_OVER, bg, NULL, final, 0, 0, 0, 0, 0, 0,
-                           bar->width, bar->height);
-  pixman_image_set_alpha_map(fg, fg_mask, 0, 0);
-  pixman_image_composite32(PIXMAN_OP_OVER, fg, fg_mask, final, 0, 0, 0, 0, 0, 0,
-                           bar->width, bar->height);
+  BarSlot next[BAR_MAX_SLOTS];
+  memset(next, 0, sizeof(next));
+  bool prev_used[BAR_MAX_SLOTS];
+  memset(prev_used, 0, sizeof(prev_used));
+  int next_n = 0;
 
-  if (getenv("MANGOBAR_DUMPPNG") && (bar->atags || bar->ctags)) {
+  for (int i = 0; i < laid_n && next_n < BAR_MAX_SLOTS; i++) {
+    LaidEntry *le = &laid[i];
+    BarSlot *ns = &next[next_n];
+    entry_signature(bar, &le->e, ns->ident, sizeof(ns->ident), ns->key,
+                    sizeof(ns->key));
+    ns->x0 = le->g.x0 * (uint32_t)scale;
+    ns->x1 = le->g.paint * (uint32_t)scale;
+    ns->y0 = (uint32_t)(top * scale);
+    ns->y1 = (uint32_t)((top + (int)buf_h) * scale);
+    bool painted = ns->x1 > ns->x0 && ns->y1 > ns->y0;
+
+    BarSlot *ps = NULL;
+    for (int k = 0; k < bar->slot_n; k++) {
+      if (!prev_used[k] && strcmp(bar->slots[k].ident, ns->ident) == 0) {
+        ps = &bar->slots[k];
+        prev_used[k] = true;
+        break;
+      }
+    }
+    bool rect_same =
+        ps && ps->x0 == ns->x0 && ps->x1 == ns->x1 && ps->y0 == ns->y0 &&
+        ps->y1 == ns->y1;
+    bool key_same = ps && strcmp(ps->key, ns->key) == 0;
+
+    if (ps && key_same && !bar->paint_all) {
+      ns->raster = ps->raster;
+      ps->raster = NULL;
+      if (!rect_same) {
+        if (ps->x1 > ps->x0)
+          dirty_add(&dmg, (int)ps->x0, (int)ps->y0, (int)ps->x1, (int)ps->y1);
+        if (painted)
+          dirty_add(&dmg, (int)ns->x0, (int)ns->y0, (int)ns->x1, (int)ns->y1);
+      }
+    } else {
+      if (painted)
+        ns->raster = render_entry_raster(bar, le, y, buf_h, scale, top);
+      if (ps) {
+        if (ps->x1 > ps->x0)
+          dirty_add(&dmg, (int)ps->x0, (int)ps->y0, (int)ps->x1, (int)ps->y1);
+        if (ps->raster)
+          pixman_image_unref(ps->raster);
+        ps->raster = NULL;
+      }
+      if (painted)
+        dirty_add(&dmg, (int)ns->x0, (int)ns->y0, (int)ns->x1, (int)ns->y1);
+    }
+    next_n++;
+  }
+  for (int k = 0; k < bar->slot_n; k++) {
+    if (prev_used[k])
+      continue;
+    if (bar->slots[k].x1 > bar->slots[k].x0)
+      dirty_add(&dmg, (int)bar->slots[k].x0, (int)bar->slots[k].y0,
+                (int)bar->slots[k].x1, (int)bar->slots[k].y1);
+    if (bar->slots[k].raster)
+      pixman_image_unref(bar->slots[k].raster);
+  }
+  memcpy(bar->slots, next, sizeof(BarSlot) * (size_t)next_n);
+  bar->slot_n = next_n;
+  bar->mid_painted = mid_valid;
+  bar->mid_x0 = mid_x0;
+  bar->mid_x1 = mid_x1;
+  bar->mid_key = mid_key;
+  bar->paint_all = false;
+
+  for (int r = 0; r < dmg.n; r++) {
+    clear_box(bar->cache, dmg.x0[r], dmg.y0[r], dmg.x1[r], dmg.y1[r]);
+    if (mid_valid) {
+      int x0 = mid_x0 > dmg.x0[r] ? mid_x0 : dmg.x0[r];
+      int y0 = mid_y0 > dmg.y0[r] ? mid_y0 : dmg.y0[r];
+      int x1 = mid_x1 < dmg.x1[r] ? mid_x1 : dmg.x1[r];
+      int y1 = mid_y1 < dmg.y1[r] ? mid_y1 : dmg.y1[r];
+      if (x1 > x0 && y1 > y0)
+        pixman_image_fill_boxes(PIXMAN_OP_SRC, bar->cache, mid_color, 1,
+                                &(pixman_box32_t){x0, y0, x1, y1});
+    }
+    for (int i = 0; i < next_n; i++)
+      blit_clipped(next[i].raster, bar->cache, (int)next[i].x0,
+                   (int)next[i].y0, dmg.x0[r], dmg.y0[r], dmg.x1[r], dmg.y1[r]);
+  }
+
+  if (getenv("MANGOBAR_DUMPPNG") && (bar->atags || bar->ctags) && dmg.n > 0) {
     cairo_surface_t *dumps = cairo_image_surface_create_for_data(
-        (unsigned char *)data, CAIRO_FORMAT_ARGB32, bar->width, bar->height,
-        bar->stride);
+        (unsigned char *)pixman_image_get_data(bar->cache),
+        CAIRO_FORMAT_ARGB32, bar->width, bar->height, bar->stride);
     cairo_surface_write_to_png(dumps, "/tmp/mangobar_bar.png");
     cairo_surface_destroy(dumps);
     fprintf(stderr, "DBG dumped atags=%x ctags=%x mtags=%x title='%s'\n",
             bar->atags, bar->ctags, bar->mtags, bar->title);
   }
 
-  pixman_image_unref(fg);
-  pixman_image_unref(fg_mask);
-  pixman_image_unref(bg);
-  pixman_image_unref(final);
-  munmap(data, bar->bufsize);
-
-  wl_surface_set_buffer_scale(bar->wl_surface, bar->scale);
-  wl_surface_attach(bar->wl_surface, buf, 0, 0);
-  wl_surface_damage_buffer(bar->wl_surface, 0, 0, bar->width, bar->height);
-  wl_surface_commit(bar->wl_surface);
-  IPC_LOG("[draw] %s committed\n", bar->name);
+  for (int r = 0; r < dmg.n; r++)
+    dirty_add(&bar->dirty, dmg.x0[r], dmg.y0[r], dmg.x1[r], dmg.y1[r]);
+  if (bar->dirty.n == 0) {
+    IPC_LOG("[draw] %s unchanged\n", bar->name);
+    return;
+  }
+  if (bar_commit(bar, &bar->dirty)) {
+    bar->dirty.n = 0;
+    bar->commit_pending = false;
+    IPC_LOG("[draw] %s committed\n", bar->name);
+  } else {
+    bar->commit_pending = true;
+    bar->redraw = true;
+    IPC_LOG("[draw] %s deferred (buffers busy)\n", bar->name);
+  }
 }
 
 static void layer_surface_configure(void *data,
@@ -1780,6 +2281,11 @@ static void profile_custom_force_refresh(MangoConfigProfile *profile);
 
 // Destroy the layer surface for a bar, if any.
 static void bar_destroy_surface(Bar *bar) {
+  bar_clear_slots(bar);
+  bar_free_layers(bar);
+  bar_free_buffers(bar);
+  bar->dirty.n = 0;
+  bar->commit_pending = false;
   if (bar->layer_surface) {
     zwlr_layer_surface_v1_destroy(bar->layer_surface);
     bar->layer_surface = NULL;
@@ -4203,6 +4709,14 @@ static void event_loop() {
       timeout = 100;
     else if (popup.open)
       timeout = 50;
+    {
+      Bar *wb;
+      wl_list_for_each(wb, &bar_list, link) if (wb->commit_pending) {
+        if (timeout > 15)
+          timeout = 15;
+        break;
+      }
+    }
 
     // Canonical libwayland read pattern: prepare, poll, read, dispatch.
     // Exit only when the compositor socket is gone (POLLHUP/POLLERR or a
@@ -4342,8 +4856,8 @@ static void event_loop() {
     Bar *b;
     wl_list_for_each(b, &bar_list, link) {
       if (b->redraw && b->configured) {
-        draw_bar(b);
         b->redraw = false;
+        draw_bar(b);
       }
     }
   }

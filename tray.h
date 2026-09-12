@@ -30,6 +30,7 @@ const char *tray_item_id(MangobarTrayItem *item);
 pixman_image_t *tray_item_icon(MangobarTrayItem *item);
 // Icon natural size
 int tray_item_icon_size(MangobarTrayItem *item);
+unsigned tray_item_icon_rev(MangobarTrayItem *item);
 // Remove a tray item (e.g. stale service)
 void tray_remove_item(MangobarTray *tray, MangobarTrayItem *item);
 // Re-register hosts and re-pull RegisteredStatusNotifierItems
